@@ -312,6 +312,7 @@ fn test_enter_battle_success() {
     // Enter battle
     start_cheat_caller_address(controller.contract_address, opponent);
     let mut spy = spy_events();
+    let initial_balance = eth.balanceOf(opponent);
     controller.enter_battle(1, 1); // Enter with Rock
     stop_cheat_block_timestamp(controller.contract_address);
     stop_cheat_caller_address(controller.contract_address);
@@ -320,6 +321,12 @@ fn test_enter_battle_success() {
     assert(battle.opponent == opponent, 'Wrong opponent');
     assert(battle.opponent_move == 1, 'Wrong move');
     assert(battle.start_date == timestamp, 'Wrong start date');
+    // Verify payment was processed
+    let final_balance = eth.balanceOf(opponent);
+    assert(final_balance == initial_balance - payoff_amount, 'Payment not processed');
+    let contract_balance = eth.balanceOf(controller.contract_address);
+    assert(contract_balance == payoff_amount, 'Contract balance wrong');
+
     spy
         .assert_emitted(
             @array![
@@ -423,4 +430,322 @@ fn test_cannot_enter_without_sufficient_balance() {
     // Don't transfer any tokens to opponent
     start_cheat_caller_address(controller.contract_address, opponent);
     controller.enter_battle(1, 1);
+}
+
+#[test]
+fn test_get_winner_success() {
+    let (controller, eth) = setup();
+    // Test all possible draw scenarios
+    assert(controller.get_winner(1_u8, 1_u8) == 0_u8, 'Rock-Rock');
+    assert(controller.get_winner(2_u8, 2_u8) == 0_u8, 'Paper-Paper');
+    assert(controller.get_winner(3_u8, 3_u8) == 0_u8, 'Scissors-Scissors');
+    // Test all scenarios where Player 1 should win
+    assert(controller.get_winner(1_u8, 3_u8) == 1_u8, 'Rock beat Scissors');
+    assert(controller.get_winner(2_u8, 1_u8) == 1_u8, 'Paper beat Rock');
+    assert(controller.get_winner(3_u8, 2_u8) == 1_u8, 'Scissors beat Paper');
+    // Test all scenarios where Player 2 should win
+    assert(controller.get_winner(3_u8, 1_u8) == 2_u8, 'Rock beat Scissors');
+    assert(controller.get_winner(1_u8, 2_u8) == 2_u8, 'Paper beat Rock');
+    assert(controller.get_winner(2_u8, 3_u8) == 2_u8, 'Scissors beat Paper');
+}
+
+#[test]
+#[should_panic(expected: 'Invalid move')]
+fn test_get_winner_with_invalid_moves() {
+    let (controller, eth) = setup();
+    controller.get_winner(0_u8, 1_u8);
+}
+
+#[test]
+fn test_resolve_battle_timeout() {
+    // Setup
+    let (controller, eth) = setup();
+    let owner = contract_address_const::<'owner'>();
+    let opponent = contract_address_const::<'opponent'>();
+    let payoff_amount: u256 = 5500000000000000000;
+    let commitment = 1416164405029674324331909544155980085306730986792554086473471855678221018328;
+    let recipient = contract_address_const::<'recipient'>();
+    // Mock battle with expired timeout
+    let start_time = 100000;
+    let timeout_delay = 12000_u64; // 1 hour
+    let current_time = start_time + timeout_delay + 1; // Just past timeout
+    // Start cheating with the ETH contract address as the caller and the recipient as the address
+    start_cheat_caller_address(eth.contract_address, recipient);
+    // Transfer the payoffs to the controller
+    eth.transfer(controller.contract_address, payoff_amount * 2);
+    stop_cheat_caller_address(eth.contract_address);
+    let mocked_battle = Battle {
+        owner: owner,
+        opponent: opponent,
+        commitment: commitment,
+        payoff: payoff_amount,
+        start_date: start_time,
+        opponent_move: 2
+    };
+
+    store(
+        controller.contract_address,
+        map_entry_address(selector!("battles_storage"), array![1].span()),
+        mocked_battle.into()
+    );
+    // Set block timestamp
+    start_cheat_block_timestamp(controller.contract_address, current_time);
+    // Try to resolve
+    let mut spy = spy_events();
+    start_cheat_caller_address(controller.contract_address, owner);
+    controller.resolve_battle(1, 1, 12345); // Move and secret don't matter in timeout
+    stop_cheat_caller_address(controller.contract_address);
+    stop_cheat_block_timestamp(controller.contract_address,);
+    // Verify opponent received funds
+    let opponent_balance = eth.balanceOf(opponent);
+    assert(opponent_balance == payoff_amount * 2, 'Wrong timeout payout');
+    // Verify battle was cleared
+    let battle = controller.get_battle(1);
+    assert(battle.payoff == 0, 'Battle not cleared');
+    assert(battle.owner == contract_address_const::<0>(), 'Owner not cleared');
+    assert(battle.commitment == 0, 'Commitment not cleared');
+    // Verify event emission
+    spy
+        .assert_emitted(
+            @array![
+                (
+                    controller.contract_address,
+                    Controller::Event::BattleResolved(
+                        Controller::BattleResolved {
+                            battle_id: 1, winner: opponent, payoff: payoff_amount * 2
+                        }
+                    )
+                )
+            ]
+        );
+}
+
+#[test]
+fn test_resolve_battle_draw() {
+    let (controller, eth) = setup();
+    let owner = contract_address_const::<'owner'>();
+    let opponent = contract_address_const::<'opponent'>();
+    let payoff_amount: u256 = 5500000000000000000;
+    let recipient = contract_address_const::<'recipient'>();
+    // Start cheating with the ETH contract address as the caller and the recipient as the address
+    start_cheat_caller_address(eth.contract_address, recipient);
+    // Transfer the payoffs to the controller
+    eth.transfer(controller.contract_address, payoff_amount * 2);
+    stop_cheat_caller_address(eth.contract_address);
+    // Both players choose Rock (1)
+    let move_num: u8 = 1;
+    let secret: felt252 = 12345;
+    //commitment generated using python script (poseidon hash)
+    let commitment = 739725270007697963362708211148095784907140316322117362604841719456368453247;
+
+    let mocked_battle = Battle {
+        owner, opponent, commitment, payoff: payoff_amount, start_date: 11111111, opponent_move: 1
+    };
+
+    store(
+        controller.contract_address,
+        map_entry_address(selector!("battles_storage"), array![1].span()),
+        mocked_battle.into()
+    );
+
+    let mut spy = spy_events();
+    start_cheat_caller_address(controller.contract_address, owner);
+    controller.resolve_battle(1, move_num, secret);
+    stop_cheat_caller_address(controller.contract_address);
+    // Verify split payout
+    let owner_balance = eth.balanceOf(owner);
+    let opponent_balance = eth.balanceOf(opponent);
+    assert(owner_balance == payoff_amount, 'Wrong owner split');
+    assert(opponent_balance == payoff_amount, 'Wrong opponent split');
+    // Verify battle was cleared
+    let battle = controller.get_battle(1);
+    assert(battle.payoff == 0, 'Battle not cleared');
+    assert(battle.owner == contract_address_const::<0>(), 'Owner not cleared');
+    assert(battle.commitment == 0, 'Commitment not cleared');
+    // Verify events
+    spy
+        .assert_emitted(
+            @array![
+                (
+                    controller.contract_address,
+                    Controller::Event::BattleResolved(
+                        Controller::BattleResolved {
+                            battle_id: 1, winner: opponent, payoff: payoff_amount
+                        }
+                    )
+                ),
+                (
+                    controller.contract_address,
+                    Controller::Event::BattleResolved(
+                        Controller::BattleResolved {
+                            battle_id: 1, winner: owner, payoff: payoff_amount
+                        }
+                    )
+                )
+            ]
+        );
+}
+
+#[test]
+fn test_resolve_battle_owner_wins() {
+    let (controller, eth) = setup();
+    let owner = contract_address_const::<'owner'>();
+    let opponent = contract_address_const::<'opponent'>();
+    let payoff_amount: u256 = 5500000000000000000;
+    let recipient = contract_address_const::<'recipient'>();
+    // Start cheating with the ETH contract address as the caller and the recipient as the address
+    start_cheat_caller_address(eth.contract_address, recipient);
+    // Transfer the payoffs to the controller
+    eth.transfer(controller.contract_address, payoff_amount * 2);
+    stop_cheat_caller_address(eth.contract_address);
+    // Owner plays Rock (1), Opponent plays Scissors (3)
+    let move_num: u8 = 1;
+    let secret: felt252 = 12345;
+    let commitment = 739725270007697963362708211148095784907140316322117362604841719456368453247;
+
+    let mocked_battle = Battle {
+        owner, opponent, commitment, payoff: payoff_amount, start_date: 11111111, opponent_move: 3
+    };
+
+    store(
+        controller.contract_address,
+        map_entry_address(selector!("battles_storage"), array![1].span()),
+        mocked_battle.into()
+    );
+
+    let mut spy = spy_events();
+    start_cheat_caller_address(controller.contract_address, owner);
+    controller.resolve_battle(1, move_num, secret);
+    stop_cheat_caller_address(controller.contract_address);
+    // Verify winner payout
+    let owner_balance = eth.balanceOf(owner);
+    assert(owner_balance == payoff_amount * 2, 'Wrong winner payout');
+    // Verify battle was cleared
+    let battle = controller.get_battle(1);
+    assert(battle.payoff == 0, 'Battle not cleared');
+    assert(battle.owner == contract_address_const::<0>(), 'Owner not cleared');
+    assert(battle.commitment == 0, 'Commitment not cleared');
+    // Verify event
+    spy
+        .assert_emitted(
+            @array![
+                (
+                    controller.contract_address,
+                    Controller::Event::BattleResolved(
+                        Controller::BattleResolved {
+                            battle_id: 1, winner: owner, payoff: payoff_amount * 2
+                        }
+                    )
+                )
+            ]
+        );
+}
+
+#[test]
+fn test_resolve_battle_owner_loose() {
+    let (controller, eth) = setup();
+    let owner = contract_address_const::<'owner'>();
+    let opponent = contract_address_const::<'opponent'>();
+    let payoff_amount: u256 = 5500000000000000000;
+    let recipient = contract_address_const::<'recipient'>();
+    // Start cheating with the ETH contract address as the caller and the recipient as the address
+    start_cheat_caller_address(eth.contract_address, recipient);
+    // Transfer the payoffs to the controller
+    eth.transfer(controller.contract_address, payoff_amount * 2);
+    stop_cheat_caller_address(eth.contract_address);
+    // Owner plays Rock (1), Opponent plays Scissors (3)
+    let move_num: u8 = 1;
+    let secret: felt252 = 12345;
+    let commitment = 739725270007697963362708211148095784907140316322117362604841719456368453247;
+
+    let mocked_battle = Battle {
+        owner, opponent, commitment, payoff: payoff_amount, start_date: 11111111, opponent_move: 2
+    };
+
+    store(
+        controller.contract_address,
+        map_entry_address(selector!("battles_storage"), array![1].span()),
+        mocked_battle.into()
+    );
+
+    let mut spy = spy_events();
+    start_cheat_caller_address(controller.contract_address, owner);
+    controller.resolve_battle(1, move_num, secret);
+    stop_cheat_caller_address(controller.contract_address);
+    // Verify winner payout
+    let opponent_balance = eth.balanceOf(opponent);
+    assert(opponent_balance == payoff_amount * 2, 'Wrong winner payout');
+    // Verify battle was cleared
+    let battle = controller.get_battle(1);
+    assert(battle.payoff == 0, 'Battle not cleared');
+    assert(battle.owner == contract_address_const::<0>(), 'Owner not cleared');
+    assert(battle.commitment == 0, 'Commitment not cleared');
+    // Verify event
+    spy
+        .assert_emitted(
+            @array![
+                (
+                    controller.contract_address,
+                    Controller::Event::BattleResolved(
+                        Controller::BattleResolved {
+                            battle_id: 1, winner: opponent, payoff: payoff_amount * 2
+                        }
+                    )
+                )
+            ]
+        );
+}
+
+#[test]
+#[should_panic(expected: 'Invalid move')]
+fn test_resolve_battle_invalid_move() {
+    let (controller, _) = setup();
+    let owner = contract_address_const::<'owner'>();
+    let opponent = contract_address_const::<'opponent'>();
+    let payoff_amount: u256 = 5500000000000000000;
+
+    let mocked_battle = Battle {
+        owner,
+        opponent,
+        commitment: 123456, // Doesn't matter for this test
+        payoff: payoff_amount,
+        start_date: 1111111,
+        opponent_move: 1
+    };
+
+    store(
+        controller.contract_address,
+        map_entry_address(selector!("battles_storage"), array![1].span()),
+        mocked_battle.into()
+    );
+
+    start_cheat_caller_address(controller.contract_address, owner);
+    controller.resolve_battle(1, 4, 12345); // Move 4 is invalid
+}
+
+#[test]
+#[should_panic(expected: 'Invalid commitment')]
+fn test_resolve_battle_invalid_commitment() {
+    let (controller, _) = setup();
+    let owner = contract_address_const::<'owner'>();
+    let opponent = contract_address_const::<'opponent'>();
+    let payoff_amount: u256 = 5500000000000000000;
+
+    let mocked_battle = Battle {
+        owner,
+        opponent,
+        commitment: 123456,
+        payoff: payoff_amount,
+        start_date: 11111111,
+        opponent_move: 1
+    };
+
+    store(
+        controller.contract_address,
+        map_entry_address(selector!("battles_storage"), array![1].span()),
+        mocked_battle.into()
+    );
+
+    start_cheat_caller_address(controller.contract_address, owner);
+    controller.resolve_battle(1, 1, 99999); // Wrong secret leads to invalid commitment
 }

@@ -107,6 +107,8 @@ pub mod Controller {
         }
 
         fn get_winner(self: @ContractState, move_p1: u8, move_p2: u8) -> u8 {
+            assert(move_p1 >= 1_u8 && move_p1 <= 3_u8, ERROR_INVALID_MOVE);
+            assert(move_p2 >= 1_u8 && move_p2 <= 3_u8, ERROR_INVALID_MOVE);
             // If moves are equal, it's a draw
             if move_p1 == move_p2 {
                 return 0_u8;
@@ -224,7 +226,7 @@ pub mod Controller {
             let owner = battle.owner;
             assert(payoff != 0, ERROR_BATTLE_NOT_FOUND);
             if (battle.start_date
-                + self.timeout_delay.read() > get_block_info().unbox().block_timestamp) {
+                + self.timeout_delay.read() < get_block_info().unbox().block_timestamp) {
                 // Opponent win without verifying moves
                 self.battles_storage.entry((battle_id)).write(Default::default());
                 eth_token_dispatcher.transfer(opponent, payoff * 2);
@@ -250,10 +252,8 @@ pub mod Controller {
                 match winner {
                     0 => { // Draw - split the pot
                         let split_amount = payoff;
-                        eth_token_dispatcher
-                            .transfer( owner, split_amount);
-                        eth_token_dispatcher
-                            .transfer(opponent, split_amount);
+                        eth_token_dispatcher.transfer(owner, split_amount);
+                        eth_token_dispatcher.transfer(opponent, split_amount);
                         self
                             .emit(
                                 Event::BattleResolved(
@@ -272,8 +272,7 @@ pub mod Controller {
                             );
                     },
                     1 => { // Player 1 (caller) wins
-                        eth_token_dispatcher
-                            .transfer(owner, payoff * 2);
+                        eth_token_dispatcher.transfer(owner, payoff * 2);
                         self
                             .emit(
                                 Event::BattleResolved(
@@ -284,8 +283,7 @@ pub mod Controller {
                             );
                     },
                     2 => { // Player 2 (opponent) wins
-                        eth_token_dispatcher
-                            .transfer(opponent, payoff * 2);
+                        eth_token_dispatcher.transfer(opponent, payoff * 2);
                         self
                             .emit(
                                 Event::BattleResolved(
