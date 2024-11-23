@@ -1,19 +1,46 @@
 use starknet::ContractAddress;
 use rps_pvp::battle::{Battle};
+
 #[starknet::interface]
+/// Defines the interface for the controller contract's functions.
 pub trait IControllerFunctions<TContractState> {
-    /// Submit move commitment.
+    /// Submits a move commitment for a battle.
+    /// @param commitment: Hash of the move and secret
+    /// @param payoff: Amount of ETH to stake
     fn submit_move_commitment(ref self: TContractState, commitment: felt252, payoff: u256);
-    /// Resolve battle.
+
+    /// Resolves a battle based on the moves and secrets submitted.
+    /// @param battle_id: ID of the battle to resolve
+    /// @param move: Move played by the owner (1=Rock, 2=Paper, 3=Scissors)
+    /// @param secret: Secret used to generate the commitment
     fn resolve_battle(ref self: TContractState, battle_id: u32, move: u8, secret: felt252);
+
+    /// Cancels a battle that hasn't started yet and refunds the owner
+    /// @param battle_id: ID of the battle to cancel
     fn cancel_battle(ref self: TContractState, battle_id: u32);
+
+    /// Enters an existing battle by submitting a move and matching the payoff
+    /// @param battle_id: ID of the battle to enter
+    /// @param move: Move to play (1=Rock, 2=Paper, 3=Scissors)
     fn enter_battle(ref self: TContractState, battle_id: u32, move: u8);
 }
 
 #[starknet::interface]
+/// Defines the interface for the controller contract's views.
 pub trait IControllerViews<TContractState> {
+    /// Retrieves a battle by its ID.
+    /// @param battle_id: ID of the battle to retrieve
+    /// @return Battle: The battle data
     fn get_battle(self: @TContractState, battle_id: u32) -> Battle;
+
+    /// Determines the winner of a battle based on the moves.
+    /// @param move_p1: Move of player 1 (1=Rock, 2=Paper, 3=Scissors)
+    /// @param move_p2: Move of player 2 (1=Rock, 2=Paper, 3=Scissors)
+    /// @return u8: 0=Draw, 1=Player1 wins, 2=Player2 wins
     fn get_winner(self: @TContractState, move_p1: u8, move_p2: u8) -> u8;
+
+    /// Returns the current index of battles.
+    /// @return u32: Current battle index
     fn get_battles_index(self: @TContractState) -> u32;
 }
 
@@ -31,14 +58,22 @@ pub mod Controller {
     use core::poseidon::poseidon_hash_span;
     use openzeppelin_token::erc20::interface::{IERC20, ERC20ABIDispatcher, ERC20ABIDispatcherTrait};
     use rps_pvp::battle::{Battle};
+
     #[storage]
+    /// Defines the storage structure for the Controller contract.
     struct Storage {
+        /// Maps battle IDs to Battle structs
         battles_storage: Map::<u32, Battle>,
+        /// Counter for generating unique battle IDs
         battles_index_storage: u32,
+        /// Address of the ETH token contract used for payoffs
         eth_address: ContractAddress,
+        /// Time allowed for owner to reveal their move before auto-loss
         timeout_delay: u64
     }
+
     #[event]
+    /// Defines the events that can be emitted by the Controller contract.
     #[derive(Drop, starknet::Event)]
     pub enum Event {
         BattleCreated: BattleCreated,
@@ -48,6 +83,7 @@ pub mod Controller {
     }
 
     #[derive(Drop, starknet::Event)]
+    /// Event emitted when a battle is created.
     pub struct BattleCreated {
         #[key]
         pub battle_id: u32,
@@ -56,6 +92,7 @@ pub mod Controller {
     }
 
     #[derive(Drop, starknet::Event)]
+    /// Event emitted when a player enters a battle.
     pub struct BattleEntered {
         #[key]
         pub battle_id: u32,
@@ -64,6 +101,7 @@ pub mod Controller {
     }
 
     #[derive(Drop, starknet::Event)]
+    /// Event emitted when a battle is resolved.
     pub struct BattleResolved {
         #[key]
         pub battle_id: u32,
@@ -72,12 +110,14 @@ pub mod Controller {
     }
 
     #[derive(Drop, starknet::Event)]
+    /// Event emitted when a battle is cancelled.
     pub struct BattleCancelled {
         #[key]
         pub battle_id: u32,
         pub owner: ContractAddress
     }
 
+    // Error messages
     pub const ERROR_INVALID_PAYOFF: felt252 = 'Invalid payoff amount';
     const ERROR_INSUFFICIENT_PAYOFF: felt252 = 'Insufficient payoff';
     const ERROR_ONLY_BATTLE_OWNER: felt252 = 'Only battle owner';
@@ -87,7 +127,7 @@ pub mod Controller {
     const ERROR_BATTLE_NOT_FOUND: felt252 = 'Battle does not exist';
 
     #[constructor]
-    /// @notice Initializes the controller with the provided timeout delay and ETH address
+    /// Initializes the controller with the provided timeout delay and ETH address
     /// @param timeout_delay: timeout delay
     /// @param eth_address: ETH token address
     fn constructor(ref self: ContractState, timeout_delay: u64, eth_address: ContractAddress) {
@@ -137,6 +177,7 @@ pub mod Controller {
     #[abi(embed_v0)]
     impl ControllerFunctionsImpl of super::IControllerFunctions<ContractState> {
         fn submit_move_commitment(ref self: ContractState, commitment: felt252, payoff: u256) {
+            // Validate payoff amount
             assert(payoff > 0, ERROR_INVALID_PAYOFF);
             let caller = get_caller_address();
             let eth_token_dispatcher = ERC20ABIDispatcher {
@@ -145,9 +186,12 @@ pub mod Controller {
             // Check if the caller has sufficient balance
             let caller_balance = eth_token_dispatcher.balanceOf(caller);
             assert(!(caller_balance < payoff), ERROR_INSUFFICIENT_PAYOFF);
+            // Transfer payoff from caller to contract
             eth_token_dispatcher.transferFrom(caller, get_contract_address(), payoff);
+            // Generate new battle ID
             let battle_id = self.battles_index_storage.read() + 1;
             self.battles_index_storage.write(battle_id);
+            // Create new battle
             let battle = Battle {
                 owner: caller,
                 opponent: contract_address_const::<0>(),
@@ -225,9 +269,11 @@ pub mod Controller {
             let payoff = battle.payoff;
             let owner = battle.owner;
             assert(payoff != 0, ERROR_BATTLE_NOT_FOUND);
+
+            // Check if battle has timed out
             if (battle.start_date
                 + self.timeout_delay.read() < get_block_info().unbox().block_timestamp) {
-                // Opponent win without verifying moves
+                // Opponent wins without verifying moves
                 self.battles_storage.entry((battle_id)).write(Default::default());
                 eth_token_dispatcher.transfer(opponent, payoff * 2);
                 self
@@ -239,16 +285,20 @@ pub mod Controller {
                         )
                     )
             } else {
+                // Validate move
                 assert(move >= 1 && move <= 3, ERROR_INVALID_MOVE);
+                // Verify commitment matches revealed move and secret
                 let move_: felt252 = move.into();
                 let mut hash_data: Array<felt252> = ArrayTrait::new();
                 Serde::serialize(@move_, ref hash_data);
                 Serde::serialize(@secret, ref hash_data);
                 let commitment = poseidon_hash_span(hash_data.span());
                 assert(commitment == battle.commitment, ERROR_INVALID_COMMITMENT);
+
+                // Determine winner and handle payouts
                 let winner = self.get_winner(move, battle.opponent_move);
                 self.battles_storage.entry((battle_id)).write(Default::default());
-                // Handle payouts based on winner
+
                 match winner {
                     0 => { // Draw - split the pot
                         let split_amount = payoff;
